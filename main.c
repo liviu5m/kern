@@ -8,6 +8,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+#include "utils.h"
 
 #define BUFFER_SIZE 4096
 
@@ -20,24 +23,6 @@ char *pathValues[256];
 int pathCount = 0;
 char *currentDirectory;
 char *homePath;
-
-char* findPathValues() {
-  char *pathEnv = getenv("PATH");
-  if(pathEnv == NULL) return NULL;
-  char *token = strstr(pathEnv, ":");
-  char *value = malloc(256); 
-  while(token != NULL) {
-    sscanf(token, "%255[^:]", value);
-    pathValues[pathCount] = malloc(strlen(value) + 1);
-    strcpy(pathValues[pathCount], value);
-    token = strstr(token + 1, ":");
-    pathCount++;
-    if(token != NULL) {
-      token++;
-    }
-  }
-  return pathEnv;
-}
 
 int isBuiltinCommand(char *command) {
 
@@ -81,37 +66,40 @@ int parseCommand(char command[], char *args[]) {
   char *buffer = malloc(strlen(command) + 1);
   while(command[i] != '\0') {
     if(command[i] == '>') {
-      if(command[i-1] == '1' || command[i-1] == '2') {
-        if(k!=0)buffer[k-1] = '\0';
+      if (k > 0) {
+          if (i > 0 && (command[i-1] == '1' || command[i-1] == '2')) {
+              buffer[k-1] = '\0';
+          } else {
+              buffer[k] = '\0';
+          }
+          if (buffer[0] != '\0') { 
+              args[counter++] = strdup(buffer);
+          }
+          k = 0;
       }
-      if(k != 0) {
-        buffer[k] = '\0';
-        args[counter] = strdup(buffer);
-        k = 0;
-        counter++;
+
+      if (i > 0 && command[i-1] == '1') strcpy(buffer, "1>");
+      else if (i > 0 && command[i-1] == '2') strcpy(buffer, "2>");
+      else strcpy(buffer, ">");
+
+      if (command[i+1] == '>') {
+          strcat(buffer, ">");
+          i++;
       }
-      if(command[i-1] == '1' || command[i-1] == '2') {
-        buffer[k++] = command[i-1];
-      }
-      buffer[k++] = '>';
-      if(command[i+1] == '>') {
-        buffer[k++] = '>';
-        i++;
-      }
-      buffer[k] = '\0';
-      args[counter] = strdup(buffer);
+      args[counter++] = strdup(buffer);
       k = 0;
-      counter++;
-    }else if(command[i] == ' ') {
+  }else if(command[i] == ' ') {
       if(!quote && !dquote) {
         if(k == 0) {
           i++;
           continue;
         }
-        buffer[k] = '\0';
-        args[counter] = strdup(buffer);
-        k = 0;
-        counter++;
+        if(k != 0) {
+          buffer[k] = '\0';
+          args[counter] = strdup(buffer);
+          k = 0;
+          counter++;
+        }
       }else buffer[k++] = command[i];
     }else if(command[i] == '\"') {
       if(!quote) dquote = !dquote;
@@ -149,13 +137,9 @@ int parseCommand(char command[], char *args[]) {
 }
 
 int commands(char command[]) {
-  command[strlen(command)-1] = '\0';
   char *args[1024];
   int ind = parseCommand(command, args);
-  for(int i = 0;i<ind;i++) {
-    printf("%s\n", args[i]);
-  }
-  printf("\n\n");
+  if(ind == 0) return 0;
   char path[BUFFER_SIZE];
   getPwd(path);
 
@@ -183,7 +167,7 @@ int commands(char command[]) {
     }
   }
 
-  if(strcmp(command, "exit\n") == 0) {
+  if(strcmp(command, "exit") == 0) {
     return -1;
   }else if(strncmp(command, "echo ", 5) == 0) {
     for(int i = 1;i<ind;i++) {
@@ -192,9 +176,8 @@ int commands(char command[]) {
       else printf("\n");
     }
   }else if(strncmp(command, "type ", 5) == 0) {
-    char *cmd = command + 5;
-    int val = isBuiltinCommand(cmd);
-    if(val == 0) printf("%s: not found\n", cmd);
+    int val = isBuiltinCommand(args[1]);
+    if(val == 0) printf("%s: not found\n", args[1]);
     return 0;
   }else if(strcmp(command, "pwd") == 0) {
     printf("%s\n", path);
@@ -226,7 +209,6 @@ int commands(char command[]) {
       return 0;
     }else if(pid == 0) {
       if(execvp(args[0], args) == -1) {
-        command[strlen(command) - 1] = '\0';
         printf("%s: command not found\n", command);
       }
       exit(EXIT_FAILURE);
@@ -240,30 +222,165 @@ int commands(char command[]) {
   return 0;
 }
 
+char* find_lcp(char **matches, int count) {
+  if (count == 0) return NULL;
+  if (count == 1) return matches[0];
+
+  static char lcp[1024];
+  strcpy(lcp, matches[0]);
+
+  for (int i = 1; i < count; i++) {
+    int j = 0;
+    while (lcp[j] != '\0' && matches[i][j] != '\0' && lcp[j] == matches[i][j]) {
+      j++;
+    }
+    lcp[j] = '\0';
+    
+    if (lcp[0] == '\0') break;
+  }
+  return lcp;
+}
+
+int handle_tab(int count, int key) {
+  char command[BUFFER_SIZE];
+  strncpy(command, rl_line_buffer, rl_point);
+  command[rl_point] = '\0';
+  char *commandsFound[BUFFER_SIZE];
+  int commandCounter = 0;
+  for(int i = 0;i<pathCount;i++) {
+    DIR *d = opendir(pathValues[i]);
+    if(d == NULL) continue;
+    struct dirent *val;
+    while((val = readdir(d)) != NULL) {
+      char fullPath[1024];
+      snprintf(fullPath, sizeof(fullPath), "%s/%s", pathValues[i], val->d_name);
+      if(strncmp(val->d_name, command, rl_point)) continue;
+
+      struct stat sb;
+      if(stat(fullPath, &sb) == 0) {
+        if(S_ISREG(sb.st_mode) && access(fullPath, X_OK) == 0) {
+          if(commandCounter < BUFFER_SIZE) {
+            if(strcmp(command, val->d_name) == 0) {
+              rl_insert_text(" ");
+              return 0;
+            }
+            char *temp = malloc(strlen(val->d_name) + 1);
+            if (temp) {
+                strcpy(temp, val->d_name);
+                commandsFound[commandCounter++] = temp;
+            }
+          }else break;
+          
+        }
+      }
+    }
+    closedir(d);
+  }
+
+  char *lcp = find_lcp(commandsFound, commandCounter);
+  if (lcp != NULL) {
+    int prefix_len = strlen(command);
+    int lcp_len = strlen(lcp);
+    if (lcp_len > prefix_len) {
+      rl_insert_text(lcp + prefix_len);
+    }
+    putchar('\a');
+    fflush(stdout);
+  }
+  if(commandCounter == 1 && strcmp(lcp, commandsFound[0])) {
+    rl_insert_text(commandsFound[0] + strlen(command));
+    rl_insert_text(" ");
+  }
+  else if(commandCounter > 1) {
+    int proceed = 1;
+    if(commandCounter >= 100) {
+      printf("\nDisplay all %i possibilities? (y or n)", commandCounter);
+      fflush(stdout);
+
+      int c = rl_read_key(); 
+      
+      if(c != 'y' && c != 'Y' && c != ' ') {
+          proceed = 0;
+          printf("\n");
+      }
+    }
+    if(proceed) {
+      int terminal_width = 80;
+      int max_len = 0;
+      for(int i = 0; i < commandCounter; i++) {
+        int len = strlen(commandsFound[i]);
+        if(len > max_len) max_len = len;
+      }
+
+      int col_width = max_len + 2;
+      int num_cols = terminal_width / col_width;
+      if (num_cols == 0) num_cols = 1;
+
+      int num_rows = (commandCounter + num_cols - 1) / num_cols;
+
+      printf("\n");
+      for (int row = 0; row < num_rows; row++) {
+        for (int col = 0; col < num_cols; col++) {
+          int index = row + (col * num_rows);
+            if (index < commandCounter) {
+              printf("%-*s", col_width, commandsFound[index]);
+            }
+        }
+        printf("\n");
+      }
+    }
+    rl_on_new_line();
+
+    rl_redisplay();
+  }
+
+
+  if(strcmp(command, "exi") == 0) rl_insert_text("t");
+  else if(strcmp(command, "ech") == 0) rl_insert_text("o ");
+  else {
+    printf("\a");
+    fflush(stdout);
+  }
+  rl_redisplay();
+  return 0;
+}
+
 int main()
 {
+  rl_bind_key('\t', handle_tab);
   homePath = getenv("HOME");
   if(homePath == NULL) homePath = "/";
   currentDirectory = malloc(BUFFER_SIZE);
   getPwd(currentDirectory);
-  findPathValues();
+  findPathValues(pathValues, &pathCount);
   while(1) {
     char *formattedDirectory;
     formattedDirectory = malloc(1024);
+    if(!formattedDirectory) return 0;
+    formattedDirectory[0] = '\0';
     char *token = strstr(currentDirectory, homePath);
     if(token != NULL) {
       formattedDirectory[0] = '~';
+      formattedDirectory[1] = '\0';
       if(strlen(token) >= strlen(homePath)) token += strlen(homePath);
       strcat(formattedDirectory, token);
+    }else {
+      strcpy(formattedDirectory, currentDirectory);
     }
-    printf("%s $ ", formattedDirectory);
+    sprintf(formattedDirectory, "%s $ ", formattedDirectory);
     fflush(stdout);
-    char command[1024];
-    fgets(command, sizeof(command), stdin);
+    char* command;
+    command = readline(formattedDirectory);
+    if (command == NULL) break;
+    if (command[0] == '\0') {
+      free(command);
+      continue;
+    }
     if(command[0] == '\n') {
       continue;
     }
     int val = commands(command);
+    free(command);
     if(val == -1) break;
   }
   return 0;
