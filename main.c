@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 #define BUFFER_SIZE 4096
 
@@ -79,7 +80,29 @@ int parseCommand(char command[], char *args[]) {
   bool quote = false, dquote = false;
   char *buffer = malloc(strlen(command) + 1);
   while(command[i] != '\0') {
-    if(command[i] == ' ') {
+    if(command[i] == '>') {
+      if(command[i-1] == '1' || command[i-1] == '2') {
+        if(k!=0)buffer[k-1] = '\0';
+      }
+      if(k != 0) {
+        buffer[k] = '\0';
+        args[counter] = strdup(buffer);
+        k = 0;
+        counter++;
+      }
+      if(command[i-1] == '1' || command[i-1] == '2') {
+        buffer[k++] = command[i-1];
+      }
+      buffer[k++] = '>';
+      if(command[i+1] == '>') {
+        buffer[k++] = '>';
+        i++;
+      }
+      buffer[k] = '\0';
+      args[counter] = strdup(buffer);
+      k = 0;
+      counter++;
+    }else if(command[i] == ' ') {
       if(!quote && !dquote) {
         if(k == 0) {
           i++;
@@ -129,8 +152,36 @@ int commands(char command[]) {
   command[strlen(command)-1] = '\0';
   char *args[1024];
   int ind = parseCommand(command, args);
+  for(int i = 0;i<ind;i++) {
+    printf("%s\n", args[i]);
+  }
+  printf("\n\n");
   char path[BUFFER_SIZE];
   getPwd(path);
+
+  int redirect_fd = -1;
+  int saved_stdout = dup(STDOUT_FILENO);
+
+  for (int i = 0; i < ind; i++) {
+    if (strncmp(args[i], ">", 1) == 0 || strncmp(args[i], "1>", 2) == 0 || strncmp(args[i], "2>", 2) == 0) {
+      bool write = true;
+      
+      if(strncmp(args[i], "1>>",3) == 0 || strncmp(args[i], "2>>",3) == 0 || strncmp(args[i], ">>",2) == 0) write = false;
+      int targetFd = -1;
+      if(strncmp(args[i], "1>", 2) == 0 || strncmp(args[i], ">", 1) == 0) targetFd = STDOUT_FILENO;
+      else if(strcmp(args[i], "2>") == 0) targetFd = STDERR_FILENO;
+      char *filename = args[i + 1];
+      if(write) redirect_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      else redirect_fd = open(filename, O_WRONLY | O_APPEND | O_CREAT, 0644);
+            
+      dup2(redirect_fd, targetFd);
+      close(redirect_fd);
+
+      args[i] = NULL; 
+      ind = i; 
+      break;
+    }
+  }
 
   if(strcmp(command, "exit\n") == 0) {
     return -1;
@@ -184,11 +235,9 @@ int commands(char command[]) {
       waitpid(pid, &status, 0);
     }
   }
+  dup2(saved_stdout, STDOUT_FILENO);
+  close(saved_stdout);
   return 0;
-}
-
-void formatPath(char *path) {
-
 }
 
 int main()
