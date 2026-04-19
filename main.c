@@ -10,19 +10,32 @@
 #include <fcntl.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <signal.h>
 #include "utils.h"
+#include "completion.h"
 
 #define BUFFER_SIZE 4096
+
+typedef struct {
+    int id;  
+    pid_t pid;       
+    char command[1024]; 
+    bool isActive;      
+} Job;
 
 char *builtinCmds[] = {
   "exit",
   "echo",
-  "type"
+  "type",
+  "jobs"
 };
-char *pathValues[256];
+char *pathValues[BUFFER_SIZE];
 int pathCount = 0;
 char *currentDirectory;
 char *homePath;
+int autoCompletionType = 0;
+int jobsCount = 0;
+Job jobs[256];
 
 int isBuiltinCommand(char *command) {
 
@@ -54,92 +67,39 @@ int isBuiltinCommand(char *command) {
   return 0;
 }
 
-void getPwd(char *buffer) {
-  if(getcwd(buffer, BUFFER_SIZE) == NULL)  {
-    printf("Error on pwd");
+int execute(char *args[],int ind, char * command) {
+  int isJob = -1;
+  if(strcmp(args[ind-1], "&") == 0) {
+    isJob = jobsCount;
+    args[ind-1] = '\0';
+    ind--;
   }
-}
-
-int parseCommand(char command[], char *args[]) {
-  int i = 0,k = 0, counter = 0;
-  bool quote = false, dquote = false;
-  char *buffer = malloc(strlen(command) + 1);
-  while(command[i] != '\0') {
-    if(command[i] == '>') {
-      if (k > 0) {
-          if (i > 0 && (command[i-1] == '1' || command[i-1] == '2')) {
-              buffer[k-1] = '\0';
-          } else {
-              buffer[k] = '\0';
-          }
-          if (buffer[0] != '\0') { 
-              args[counter++] = strdup(buffer);
-          }
-          k = 0;
+  if(isJob != -1) {
+    pid_t jobId = fork();
+    if(jobId > 0) {
+      char cmd[1024] = "";
+      for(int i = 0;i<ind;i++) {
+        strcat(cmd, args[i]);
+        if(i != ind-1) strcat(cmd, " ");
       }
+      jobs[jobsCount].id = jobsCount;
+      jobs[jobsCount].pid = jobId;
+      jobs[jobsCount].isActive = true;
+      strncpy(jobs[jobsCount].command, cmd, sizeof(jobs[jobsCount].command) - 1);
+      jobs[jobsCount].command[sizeof(jobs[jobsCount].command) - 1] = '\0';
+      jobsCount++;
+      
+      printf("[%d] %d \n", jobsCount, jobId);
 
-      if (i > 0 && command[i-1] == '1') strcpy(buffer, "1>");
-      else if (i > 0 && command[i-1] == '2') strcpy(buffer, "2>");
-      else strcpy(buffer, ">");
-
-      if (command[i+1] == '>') {
-          strcat(buffer, ">");
-          i++;
-      }
-      args[counter++] = strdup(buffer);
-      k = 0;
-  }else if(command[i] == ' ') {
-      if(!quote && !dquote) {
-        if(k == 0) {
-          i++;
-          continue;
-        }
-        if(k != 0) {
-          buffer[k] = '\0';
-          args[counter] = strdup(buffer);
-          k = 0;
-          counter++;
-        }
-      }else buffer[k++] = command[i];
-    }else if(command[i] == '\"') {
-      if(!quote) dquote = !dquote;
-      else buffer[k++] = '\"';
-    }else if(command[i] == '\'') {
-      if(dquote) buffer[k++] = '\'';
-      else quote = !quote;
-    }
-    else if(command[i] == '\\' && dquote) {
-      char next = command[i+1];
-      if (next == '\"' || next == '\\' || next == '$' || next == '`' || next == '\n') {
-        i++;
-        buffer[k++] = command[i];
-      } else {
-        buffer[k++] = command[i];
-      }
-    }else if(command[i] == '\\' && quote) {
-      buffer[k++] = command[i];
-    }else if(command[i] == '\\') {
-      i++;
-      buffer[k++] = command[i];
+      return 0;
     }else {
-      buffer[k++] = command[i];
+      if(execvp(args[0], args) == -1) {
+        perror("execvp");
+        _exit(1);
+      }
     }
-    i++;
   }
-  if (k > 0) {
-    buffer[k] = '\0';
-    args[counter++] = strdup(buffer);
-  }else if((quote || dquote) && k == 0) {
-    args[counter++] = strdup("");
-  }
-  args[counter] = NULL;
-  return counter;
-}
 
-int commands(char command[]) {
-  char *args[1024];
-  int ind = parseCommand(command, args);
-  if(ind == 0) return 0;
   char path[BUFFER_SIZE];
   getPwd(path);
 
@@ -202,6 +162,10 @@ int commands(char command[]) {
         printf("No such file or directory\n");
       }
     }    
+  }else if(strcmp(args[0], "jobs")==0) {
+    for(int i = 0;i<jobsCount;i++) {
+      printf("[%d]  + Running       %s\n", jobs[i].id + 1, jobs[i].command);
+    }
   }else {
     pid_t pid = fork();
     if(pid < 0) {
@@ -217,137 +181,94 @@ int commands(char command[]) {
       waitpid(pid, &status, 0);
     }
   }
+  
   dup2(saved_stdout, STDOUT_FILENO);
   close(saved_stdout);
+  if(isJob != -1) {
+    exit(EXIT_SUCCESS);
+  }
+}
+
+void removeIndexFromArray(int ind) {
+  for (int i = ind; i < jobsCount - 1; i++) {
+      jobs[i] = jobs[i + 1];
+  }
+  
+  jobsCount--;
+
+  memset(&jobs[jobsCount], 0, sizeof(Job));
+  jobs[jobsCount].isActive = false;
+}
+
+void handle_sigchld(int sig) {
+  int status;
+  pid_t pid;
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    for (int i = 0; i < jobsCount; i++) {
+      if (jobs[i].pid == pid && jobs[i].isActive) {
+        printf("\r\033[K");
+        fflush(stdout);
+        printf("[%d]  %c %d done       %s\n", jobs[i].id + 1, i == 0 ? '-' : '+' ,jobs[i].pid, jobs[i].command);
+        rl_on_new_line();
+        rl_redisplay();
+        removeIndexFromArray(i);
+        i--;
+      }
+    }
+  }
+}
+
+int commands(char command[]) {
+  char *args[1024];
+  int ind = parseCommand(command, args);
+  if(ind == 0) return 0;
+  
+  int startI = 0;
+  char *perArgs[1024];
+  int argsCount = 0;
+  while(startI<ind) {
+    for(int i = startI;i<ind;i++) {
+      if(strcmp(args[i], "&&") == 0) break;
+      else {
+        perArgs[argsCount++] = args[i];
+      }
+    }
+    int status = execute(perArgs, argsCount, command);
+    if(status == -1) return 0;
+    startI += argsCount + 1;
+    argsCount = 0;
+    perArgs[0] = '\0';
+  }
   return 0;
 }
 
-char* find_lcp(char **matches, int count) {
-  if (count == 0) return NULL;
-  if (count == 1) return matches[0];
 
-  static char lcp[1024];
-  strcpy(lcp, matches[0]);
 
-  for (int i = 1; i < count; i++) {
-    int j = 0;
-    while (lcp[j] != '\0' && matches[i][j] != '\0' && lcp[j] == matches[i][j]) {
-      j++;
-    }
-    lcp[j] = '\0';
-    
-    if (lcp[0] == '\0') break;
+int detectSpace() {
+  int c = 0;
+  for(int i = 0;rl_line_buffer[i] != '\0';i++) {
+    if(rl_line_buffer[i] == ' ') c++;
   }
-  return lcp;
+  if(c == 0) autoCompletionType = 0;
+  else autoCompletionType = 1;
+  return 0;
 }
 
-int handle_tab(int count, int key) {
-  char command[BUFFER_SIZE];
-  strncpy(command, rl_line_buffer, rl_point);
-  command[rl_point] = '\0';
-  char *commandsFound[BUFFER_SIZE];
-  int commandCounter = 0;
-  for(int i = 0;i<pathCount;i++) {
-    DIR *d = opendir(pathValues[i]);
-    if(d == NULL) continue;
-    struct dirent *val;
-    while((val = readdir(d)) != NULL) {
-      char fullPath[1024];
-      snprintf(fullPath, sizeof(fullPath), "%s/%s", pathValues[i], val->d_name);
-      if(strncmp(val->d_name, command, rl_point)) continue;
-
-      struct stat sb;
-      if(stat(fullPath, &sb) == 0) {
-        if(S_ISREG(sb.st_mode) && access(fullPath, X_OK) == 0) {
-          if(commandCounter < BUFFER_SIZE) {
-            if(strcmp(command, val->d_name) == 0) {
-              rl_insert_text(" ");
-              return 0;
-            }
-            char *temp = malloc(strlen(val->d_name) + 1);
-            if (temp) {
-                strcpy(temp, val->d_name);
-                commandsFound[commandCounter++] = temp;
-            }
-          }else break;
-          
-        }
-      }
+int handleTabCompletion() {
+  if(!autoCompletionType) {
+    if(handleTabCommandCompletion(pathValues, pathCount) == 1) {
+      handleTabFileCompletion();
     }
-    closedir(d);
   }
-
-  char *lcp = find_lcp(commandsFound, commandCounter);
-  if (lcp != NULL) {
-    int prefix_len = strlen(command);
-    int lcp_len = strlen(lcp);
-    if (lcp_len > prefix_len) {
-      rl_insert_text(lcp + prefix_len);
-    }
-    putchar('\a');
-    fflush(stdout);
-  }
-  if(commandCounter == 1 && strcmp(lcp, commandsFound[0])) {
-    rl_insert_text(commandsFound[0] + strlen(command));
-    rl_insert_text(" ");
-  }
-  else if(commandCounter > 1) {
-    int proceed = 1;
-    if(commandCounter >= 100) {
-      printf("\nDisplay all %i possibilities? (y or n)", commandCounter);
-      fflush(stdout);
-
-      int c = rl_read_key(); 
-      
-      if(c != 'y' && c != 'Y' && c != ' ') {
-          proceed = 0;
-          printf("\n");
-      }
-    }
-    if(proceed) {
-      int terminal_width = 80;
-      int max_len = 0;
-      for(int i = 0; i < commandCounter; i++) {
-        int len = strlen(commandsFound[i]);
-        if(len > max_len) max_len = len;
-      }
-
-      int col_width = max_len + 2;
-      int num_cols = terminal_width / col_width;
-      if (num_cols == 0) num_cols = 1;
-
-      int num_rows = (commandCounter + num_cols - 1) / num_cols;
-
-      printf("\n");
-      for (int row = 0; row < num_rows; row++) {
-        for (int col = 0; col < num_cols; col++) {
-          int index = row + (col * num_rows);
-            if (index < commandCounter) {
-              printf("%-*s", col_width, commandsFound[index]);
-            }
-        }
-        printf("\n");
-      }
-    }
-    rl_on_new_line();
-
-    rl_redisplay();
-  }
-
-
-  if(strcmp(command, "exi") == 0) rl_insert_text("t");
-  else if(strcmp(command, "ech") == 0) rl_insert_text("o ");
-  else {
-    printf("\a");
-    fflush(stdout);
-  }
-  rl_redisplay();
+  else handleTabFileCompletion();
   return 0;
 }
 
 int main()
 {
-  rl_bind_key('\t', handle_tab);
+  signal(SIGCHLD, handle_sigchld);
+  rl_bind_key('\t', handleTabCompletion);
+  rl_event_hook = detectSpace;
   homePath = getenv("HOME");
   if(homePath == NULL) homePath = "/";
   currentDirectory = malloc(BUFFER_SIZE);
